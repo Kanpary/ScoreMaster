@@ -1,0 +1,128 @@
+workflows:
+  score-master-signing-bootstrap:
+    name: Score Master - Criar chave de release uma vez
+    max_build_duration: 20
+    instance_type: mac_mini_m2
+    environment:
+      java: 17
+      groups:
+      - score_master_signing_bootstrap
+    scripts:
+    - name: Gerar e verificar uma chave protegida
+      script: |
+        set -eu
+        : "${SCORE_MASTER_RELEASE_PASSWORD:?Configure a variável secreta SCORE_MASTER_RELEASE_PASSWORD}"
+        if test ${#SCORE_MASTER_RELEASE_PASSWORD} -lt 16; then printf '%s\n' 'Use uma senha aleatória com pelo menos 16 caracteres.'; exit 1; fi
+        OUTPUT="$CM_BUILD_DIR/keystore-output"
+        mkdir -p "$OUTPUT"
+        chmod 700 "$OUTPUT"
+        keytool -genkeypair -noprompt -alias scoremaster_release -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Score Master Release" -storetype PKCS12 -keystore "$OUTPUT/score-master-release.p12" -storepass:env SCORE_MASTER_RELEASE_PASSWORD -keypass:env SCORE_MASTER_RELEASE_PASSWORD
+        keytool -list -keystore "$OUTPUT/score-master-release.p12" -storepass:env SCORE_MASTER_RELEASE_PASSWORD -alias scoremaster_release >/dev/null
+        chmod 600 "$OUTPUT/score-master-release.p12"
+        printf '%s\n' 'Chave criada. Baixe o .p12, guarde uma cópia privada e importe no serviço de assinatura usando a mesma senha e alias scoremaster_release.'
+    artifacts:
+    - keystore-output/score-master-release.p12
+  score-master-release:
+    name: Score Master - Release assinado
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      java: 17
+      node: 22
+      groups:
+      - score_master_firebase
+      android_signing:
+      - score_master_release
+      vars:
+        PACKAGE_NAME: com.scoremaster.app
+    scripts:
+    - name: Validar configuração Firebase de produção
+      script: |
+        set -eu
+        if test -f "$CM_BUILD_DIR/abScore-Master.zip"; then unzip -q -o "$CM_BUILD_DIR/abScore-Master.zip" -d "$CM_BUILD_DIR"; fi
+        PROJECT_ROOT="$CM_BUILD_DIR"
+        if test ! -d "$PROJECT_ROOT/app" && test -d "$CM_BUILD_DIR/ScoreMaster/app"; then PROJECT_ROOT="$CM_BUILD_DIR/ScoreMaster"; fi
+        test -n "$GOOGLE_SERVICES_JSON"
+        printf '%s' "$GOOGLE_SERVICES_JSON" > "$PROJECT_ROOT/app/google-services.json"
+        cd "$PROJECT_ROOT"
+        node scripts/check-firebase-config.mjs
+    - name: Verificar JavaScript do painel
+      script: |
+        set -eu
+        if test -f "$CM_BUILD_DIR/abScore-Master.zip"; then unzip -q -o "$CM_BUILD_DIR/abScore-Master.zip" -d "$CM_BUILD_DIR"; fi
+        PROJECT_ROOT="$CM_BUILD_DIR"
+        if test ! -d "$PROJECT_ROOT/app" && test -d "$CM_BUILD_DIR/ScoreMaster/app"; then PROJECT_ROOT="$CM_BUILD_DIR/ScoreMaster"; fi
+        cd "$PROJECT_ROOT"
+        node --check dist/admin.mjs
+    - name: Preparar SDK
+      script: |
+        set -eu
+        if test -f "$CM_BUILD_DIR/abScore-Master.zip"; then unzip -q -o "$CM_BUILD_DIR/abScore-Master.zip" -d "$CM_BUILD_DIR"; fi
+        PROJECT_ROOT="$CM_BUILD_DIR"
+        if test ! -d "$PROJECT_ROOT/app" && test -d "$CM_BUILD_DIR/ScoreMaster/app"; then PROJECT_ROOT="$CM_BUILD_DIR/ScoreMaster"; fi
+        printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > "$PROJECT_ROOT/local.properties"
+        sdkmanager "platforms;android-36" "build-tools;36.0.0"
+    - name: Verificar e compilar release
+      script: |
+        set -eu
+        if test -f "$CM_BUILD_DIR/abScore-Master.zip"; then unzip -q -o "$CM_BUILD_DIR/abScore-Master.zip" -d "$CM_BUILD_DIR"; fi
+        PROJECT_ROOT="$CM_BUILD_DIR"
+        if test ! -d "$PROJECT_ROOT/app" && test -d "$CM_BUILD_DIR/ScoreMaster/app"; then PROJECT_ROOT="$CM_BUILD_DIR/ScoreMaster"; fi
+        cd "$PROJECT_ROOT"
+        chmod +x gradlew
+        ./gradlew --no-daemon :app:validateReleaseConfiguration :domain:test :app:testReleaseUnitTest :app:lintRelease :app:assembleRelease :app:bundleRelease
+    - name: Verificar assinatura e integridade do APK
+      script: |
+        set -eu
+        if test -f "$CM_BUILD_DIR/abScore-Master.zip"; then unzip -q -o "$CM_BUILD_DIR/abScore-Master.zip" -d "$CM_BUILD_DIR"; fi
+        PROJECT_ROOT="$CM_BUILD_DIR"
+        if test ! -d "$PROJECT_ROOT/app" && test -d "$CM_BUILD_DIR/ScoreMaster/app"; then PROJECT_ROOT="$CM_BUILD_DIR/ScoreMaster"; fi
+        APK="$PROJECT_ROOT/app/build/outputs/apk/release/app-release.apk"
+        "$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
+        "$ANDROID_SDK_ROOT/build-tools/36.0.0/aapt" dump badging "$APK" > "$PROJECT_ROOT/app/build/outputs/apk/release/apk-metadata.txt"
+        cd "$PROJECT_ROOT/app/build/outputs/apk/release"
+        shasum -a 256 app-release.apk > app-release.apk.sha256
+    artifacts:
+    - app/build/outputs/apk/release/*
+    - app/build/outputs/bundle/release/*.aab
+    - app/build/reports/lint-results-release.html
+    - domain/build/reports/tests/test/**
+    - app/build/reports/tests/testReleaseUnitTest/**
+    - ScoreMaster/app/build/outputs/apk/release/*
+    - ScoreMaster/app/build/outputs/bundle/release/*.aab
+    - ScoreMaster/app/build/reports/lint-results-release.html
+    - ScoreMaster/domain/build/reports/tests/test/**
+    - ScoreMaster/app/build/reports/tests/testReleaseUnitTest/**
+  score-master-firebase-deploy:
+    name: Score Master - Implantar Firebase real
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    environment:
+      node: 22
+      groups:
+      - score_master_firebase
+    scripts:
+    - name: Implantar regras Firestore e painel no plano gratuito
+      script: |
+        set -eu
+        if test -f "$CM_BUILD_DIR/abScore-Master.zip"; then unzip -q -o "$CM_BUILD_DIR/abScore-Master.zip" -d "$CM_BUILD_DIR"; fi
+        PROJECT_ROOT="$CM_BUILD_DIR"
+        if test ! -d "$PROJECT_ROOT/app" && test -d "$CM_BUILD_DIR/ScoreMaster/app"; then PROJECT_ROOT="$CM_BUILD_DIR/ScoreMaster"; fi
+        : "${FIREBASE_PROJECT_ID:?Informe o projeto real}"
+        : "${FIREBASE_DEPLOY_SERVICE_ACCOUNT_JSON:?Configure credencial privada autorizada para implantação}"
+        : "${GOOGLE_SERVICES_JSON:?Configure o aplicativo Android real}"
+        cd "$PROJECT_ROOT"
+        umask 077
+        CREDENTIAL_PATH="$CM_BUILD_DIR/firebase-deploy-credentials.json"
+        trap 'rm -f "$CREDENTIAL_PATH"' EXIT
+        printf '%s' "$FIREBASE_DEPLOY_SERVICE_ACCOUNT_JSON" > "$CREDENTIAL_PATH"
+        export GOOGLE_APPLICATION_CREDENTIALS="$CREDENTIAL_PATH"
+        printf '%s' "$GOOGLE_SERVICES_JSON" > "$PROJECT_ROOT/app/google-services.json"
+        node scripts/check-firebase-config.mjs
+        node scripts/prepare-firebase-project.mjs
+        npm install --global firebase-tools
+        firebase deploy --project "$FIREBASE_PROJECT_ID" --non-interactive --only firestore:rules,firestore:indexes,hosting
+        if test -n "${SCORE_ADMIN_EMAIL:-}"; then
+          npm --prefix "$PROJECT_ROOT/firebase/functions" ci --omit=dev
+          node "$PROJECT_ROOT/firebase/functions/scripts/bootstrap-admin.mjs"
+        fi
